@@ -1,0 +1,10 @@
+requests
+python-dotenv
+langchain
+langchain-openai
+langchain-community
+langchain-google-genai
+langchain-groq
+langchain-together
+langchain-fireworks
+langchain-mistralai
