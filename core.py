@@ -1,5 +1,8 @@
-import time
 import os
+# ChatFireworks breaks protobuf, so we set this environment variable
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
+import time
 import logging
 from typing import Optional, Type
 from dotenv import load_dotenv
@@ -12,8 +15,7 @@ from langchain_mistralai import ChatMistralAI
 from config import PROVIDER_CONFIG, RATE_LIMIT_SYNS
 
 
-# ChatFireworks breaks protobuf, so we set this environment variable
-os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 
 # Configure logging
 logging.basicConfig(
@@ -23,54 +25,58 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
-load_dotenv()  # Loads '{PROVIDER_NAME}_API_KEY' env-vars
+load_dotenv(override=True)  # Loads '{PROVIDER_NAME}_API_KEY_{idx}' env-vars and forces reload
 # ───────────────────────── Builder for one provider ─────────────────────────
 def _build_llm(provider: str, model_name: str):
     """
-    Build a language model client for the specified provider and model.
+    Build language model clients for the specified provider and model.
     
     Args:
         provider (str): The name of the LLM provider
         model_name (str): The specific model to use from the provider
         
     Returns:
-        A langchain chat model instance or None if API key is missing
-        
-    Raises:
-        ValueError: If the provider is unknown
+        A list of langchain chat model instances or empty list if all API keys are missing
     """
     provider = provider.upper().strip()
-    api_key_env = f"{provider}_API_KEY"
-    api_key = os.environ.get(api_key_env)
+    models = []
+    idx = 1
     
-    if not api_key:
-        logger.warning(f"No API key found for {provider} in environment variable {api_key_env}")
-        return None
+    while True:
+        api_key_env = f"{provider}_API_KEY_{idx}"
+        api_key = os.environ.get(api_key_env)
         
-    logger.debug(f"Building LLM for provider: {provider}, model: {model_name}")
+        # If no API key found for this index, stop looking for more keys
+        if not api_key:
+            logger.debug(f"No API key found for {api_key_env}, stopping search for {provider} keys")
+            break
+            
+        logger.debug(f"Found API key for {provider} (index {idx})")
+        try:
+            if provider == "FIREWORKSAI":
+                models.append(ChatFireworks(model_name=model_name, fireworks_api_key=api_key))
+            elif provider == "TOGETHERAI":
+                models.append(ChatTogether(model_name=model_name, together_api_key=api_key))
+            elif provider == "GOOGLE_AI_STUDIO":
+                models.append(ChatGoogleGenerativeAI(model=model_name, api_key=api_key))
+            elif provider == "GROQ":
+                models.append(ChatGroq(model_name=model_name, groq_api_key=api_key))
+            elif provider == "MISTRAL":
+                models.append(ChatMistralAI(model=model_name, api_key=api_key))
+            elif provider == "OPENROUTER":
+                models.append(ChatOpenAI(model=model_name, api_key=api_key, base_url="https://openrouter.ai/api/v1",
+                max_tokens=6665))
+            elif provider == "CEREBRAS":
+                models.append(ChatOpenAI(model=model_name,api_key=api_key, base_url="https://api.cerebras.ai/v1",))
+            else:
+                logger.warning(f"Unknown provider: {provider}")
+                break
+        except Exception as e:
+            logger.error(f"Error initializing {provider} with key {idx}: {type(e).__name__}: {e}")
+        
+        idx += 1
     
-    try:
-        if provider == "FIREWORKSAI":
-            return ChatFireworks(model_name=model_name, fireworks_api_key=api_key)
-        if provider == "TOGETHERAI":
-            return ChatTogether(model_name=model_name, together_api_key=api_key)
-        if provider == "GOOGLE_AI_STUDIO":
-            return ChatGoogleGenerativeAI(model=model_name, api_key=api_key)
-        if provider == "GROQ":
-            return ChatGroq(model_name=model_name, groq_api_key=api_key)
-        if provider == "MISTRAL":
-            return ChatMistralAI(model=model_name, api_key=api_key)
-        if provider == "OPENROUTER":
-            return ChatOpenAI(model=model_name, api_key=api_key, base_url="https://openrouter.ai/api/v1",
-            model_kwargs={"max_tokens": 6665},) # Free Account error ssay I can get only 6666 tokens
-        if provider == "CEREBRAS":
-            return ChatOpenAI(model=model_name,api_key=api_key, base_url="https://api.cerebras.ai/v1",)
-
-        logger.warning(f"Unknown provider: {provider}")
-        raise ValueError(f"Unknown provider: {provider}")
-    except Exception as e:
-        logger.error(f"Error initializing {provider}: {type(e).__name__}: {e}")
-        return None
+    return models
 
 # ────────────────────────── the router itself ───────────────────────────────
 class OpenRouter:
@@ -91,21 +97,26 @@ class OpenRouter:
         """
         self._config = config if config is not None else MODELS_CONFIG
         self._llms = []
+        self._backoff_until = []
         self._init_llms()
-        # Track backoff times for each LLM
-        self._backoff_until = [0] * len(self._llms)  # When each LLM can be used again (timestamp)
         
     def _init_llms(self):
         """Initialize LLM providers from configuration."""
-        logger.debug("Starting LLM initialization...")
-        for conf in self._config:
-            try:
-                llm = _build_llm(conf["provider"], conf["default_model_to_use"])
-                if llm is not None:
-                    self._llms.append(llm)
-                    logger.debug(f"Successfully initialized {conf['provider']} with model {conf['default_model_to_use']}")
-            except Exception as e:
-                logger.warning(f"Skipping {conf['provider']}: {e}")
+        self._llms = []
+        self._backoff_until = []
+        
+        for provider_config in self._config:
+            provider = provider_config["provider"]
+            model = provider_config["default_model_to_use"]
+            
+            models = _build_llm(provider, model)
+            if models:
+                self._llms.extend(models)
+                self._backoff_until.extend([0] * len(models))  # No backoff initially
+                logger.info(f"Initialized {provider} with model {model} ({len(models)} API keys)")
+            else:
+                logger.warning(f"Failed to initialize {provider} with model {model} (no valid API keys)")
+
                 
         if not self._llms:
             logger.critical("No providers initialized - check API keys in .env file")
@@ -239,7 +250,7 @@ class OpenRouter:
 
 if __name__ == "__main__":
 
-    from free_llm_router import OpenRouter
+    from core import OpenRouter
     from config import PROVIDER_CONFIG
     
     router = OpenRouter(config=PROVIDER_CONFIG)

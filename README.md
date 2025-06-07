@@ -28,6 +28,7 @@ I built this router because:
 The Free LLM Router is your wingman that:
 
 - Automatically routes your requests to the best available free LLM provider
+- Supports key routing. For the same provider, if you have multiple API keys from different accounts, use them as `{PROVIDER_NAME}_API_KEY_{idx}`
 - Handles rate limits and failures with grace (unlike me when my code doesn't compile)
 - Supports structured output for when you need your AI to be more organized than your sock drawer
 - Works with the biggest, baddest models available for free (ATLEAST 13B+ parameters)
