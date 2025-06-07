@@ -71,6 +71,8 @@ def _build_llm(provider: str, model_name: str):
             else:
                 logger.warning(f"Unknown provider: {provider}")
                 break
+
+            models[-1].__dict__["api_key_index"] = api_key_env
         except Exception as e:
             logger.error(f"Error initializing {provider} with key {idx}: {type(e).__name__}: {e}")
         

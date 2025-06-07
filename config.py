@@ -28,11 +28,11 @@ PROVIDER_CONFIG = [
     {
       "provider": "GROQ", # Ultra-low latency
       "available_free_models": [
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
         "llama-3.3-70b-versatile",
-        "deepseek-r1-distill-llama-70b",
-        "meta-llama/llama-4-maverick-17b-128e-instruct"
+        "deepseek-r1-distill-llama-70b"
       ],
-      "default_model_to_use": "llama-3.3-70b-versatile"
+      "default_model_to_use": "meta-llama/llama-4-maverick-17b-128e-instruct"
     },
     {
       "provider": "TOGETHERAI", # Good accuracy, moderate limits
