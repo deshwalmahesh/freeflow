@@ -12,9 +12,13 @@ from langchain_groq import ChatGroq
 from langchain_together import ChatTogether
 from langchain_fireworks import ChatFireworks
 from langchain_mistralai import ChatMistralAI
-from config import PROVIDER_CONFIG, RATE_LIMIT_SYNS
+from langchain_core.language_models.chat_models import BaseChatModel
 
-
+# Handle both relative and absolute imports
+try:
+    from .config import PROVIDER_CONFIG, RATE_LIMIT_SYNS
+except ImportError:
+    from config import PROVIDER_CONFIG, RATE_LIMIT_SYNS
 
 
 # Configure logging
@@ -64,7 +68,7 @@ def _build_llm(provider: str, model_name: str):
             elif provider == "MISTRAL":
                 models.append(ChatMistralAI(model=model_name, api_key=api_key))
             elif provider == "OPENROUTER":
-                models.append(ChatOpenAI(model=model_name, api_key=api_key, base_url="https://openrouter.ai/api/v1",
+                models.append(ChatOpenAI(model=model_name, api_key=api_key, base_url="https://api.openrouter.ai/v1",
                 max_tokens=6665))
             elif provider == "CEREBRAS":
                 models.append(ChatOpenAI(model=model_name,api_key=api_key, base_url="https://api.cerebras.ai/v1",))
@@ -80,188 +84,300 @@ def _build_llm(provider: str, model_name: str):
     
     return models
 
-# ────────────────────────── the router itself ───────────────────────────────
-class OpenRouter:
+class FreeFlowRouter(BaseChatModel):
     """
-    Router for LLM providers that automatically handles failover.
+    Router that delegates ANY method call to the best available LangChain model.
     
-    This router always starts with the first LLM in the list (llms[0]) and falls through 
-    to other providers when encountering rate limits or other errors. It uses exponential 
-    backoff to avoid repeatedly hitting rate limits on the same provider.
+    Simple logic:
+    1. Load all models from config
+    2. Best model = last successful model, or first available (index 0+)
+    3. Any method call gets delegated with automatic failover
     """
 
-    def __init__(self, config=None):
-        """Initialize the router with backoff tracking for each LLM.
-        
-        Args:
-            config (List[Dict[str, Any]], optional): Configuration for LLM providers.
-                Defaults to MODELS_CONFIG.
-        """
-        self._config = config if config is not None else MODELS_CONFIG
+    def __init__(self, config=None, **kwargs):
+        super().__init__(**kwargs)
+        self._config = config if config is not None else PROVIDER_CONFIG
         self._llms = []
         self._backoff_until = []
+        self._last_successful_idx = 0
         self._init_llms()
         
     def _init_llms(self):
-        """Initialize LLM providers from configuration."""
+        """Load all models from config."""
         self._llms = []
         self._backoff_until = []
         
         for provider_config in self._config:
             provider = provider_config["provider"]
-            model = provider_config["default_model_to_use"]
+            model = provider_config["available_free_models"][0]
             
             models = _build_llm(provider, model)
             if models:
                 self._llms.extend(models)
-                self._backoff_until.extend([0] * len(models))  # No backoff initially
-                logger.info(f"Initialized {provider} with model {model} ({len(models)} API keys)")
+                self._backoff_until.extend([0] * len(models))
+                logger.info(f"Loaded {provider} with {model} ({len(models)} keys)")
             else:
-                logger.warning(f"Failed to initialize {provider} with model {model} (no valid API keys)")
+                logger.warning(f"Failed to load {provider} with {model}")
 
-                
         if not self._llms:
-            logger.critical("No providers initialized - check API keys in .env file")
-            raise RuntimeError("No providers initialized - check API keys in .env file.")
-        
-    def _call(
-        self,
-        llm,
-        prompt: str,
-        schema: Optional[Type] = None,
-        **kwargs,
-    ):
-        """
-        Internal method to call an LLM with the given parameters.
-        
-        Args:
-            llm: The language model to call
-            prompt (str): The prompt to send to the LLM
-            schema (Optional[Type]): Pydantic schema for structured output
-            **kwargs: Additional arguments to pass to the LLM
+            raise RuntimeError("No providers initialized - check API keys in .env file")
+    
+    def _get_best_model(self):
+        """Get the best available model: last successful, or first available."""
+        if not self._llms:
+            raise RuntimeError("No LLM providers available")
             
-        Returns:
-            The response from the LLM
-        """
-        if schema:
-            llm = llm.with_structured_output(schema)
-        return llm.invoke(prompt, **kwargs)
-
-    def invoke(
-        self,
-        prompt: str,
-        schema: Optional[Type] = None,
-        temperature: float = None,
-        **kwargs,
-    ):
-        """
-        Invoke an LLM with the given prompt and parameters.
-        
-        This method tries each LLM in the rotation list, starting from the first one
-        and using exponential backoff for rate-limited models. It always tries to use
-        the best models first if they're not in backoff.
-        
-        Args:
-            prompt (str): The prompt to send to the LLM
-            schema (Optional[Type]): Pydantic schema for structured output
-            temperature (float, optional): Temperature parameter for generation
-            **kwargs: Additional arguments to pass to the LLM
-            
-        Returns:
-            The response from the first successful LLM
-            
-        Raises:
-            RuntimeError: If all LLMs fail
-        """
-        # Get current time to check backoff status
         current_time = time.time()
         
-        # Create a list of indices to try in original order (best first)
-        indices_to_try = list(range(len(self._llms)))
-            
-        logger.debug(f"Starting LLM invocation with {len(indices_to_try)} providers available")
+        # Try last successful model first
+        if (self._last_successful_idx < len(self._llms) and 
+            current_time >= self._backoff_until[self._last_successful_idx]):
+            return self._llms[self._last_successful_idx]
         
-        for idx in indices_to_try:
-            # Skip this LLM if it's in backoff period
-            if current_time < self._backoff_until[idx]:
-                backoff_remaining = int(self._backoff_until[idx] - current_time)
-                logger.debug(f"Skipping provider at index {idx} (in backoff for {backoff_remaining} more seconds)")
-                continue
-                
+        # Otherwise, find first available (index 0+)
+        for idx in range(len(self._llms)):
+            if current_time >= self._backoff_until[idx]:
+                return self._llms[idx]
+        
+        # All in backoff - return shortest backoff
+        min_idx = min(range(len(self._backoff_until)), key=lambda i: self._backoff_until[i])
+        return self._llms[min_idx]
+    
+    def _apply_backoff(self, idx, error_msg):
+        """Apply backoff based on error type."""
+        current_time = time.time()
+        if any(s in error_msg.lower() for s in RATE_LIMIT_SYNS):
+            # Exponential backoff for rate limits
+            current_backoff = max(60, (self._backoff_until[idx] - current_time) * 2 
+                                if self._backoff_until[idx] > current_time else 60)
+            self._backoff_until[idx] = current_time + current_backoff
+        else:
+            # Short backoff for other errors
+            self._backoff_until[idx] = current_time + 10
+    
+    def _try_all_models(self, method_name, *args, **kwargs):
+        """Try method on all models with smart ordering."""
+        current_time = time.time()
+        last_exception = None
+        
+        # Smart ordering: last successful first, then others
+        indices = []
+        if (self._last_successful_idx < len(self._llms) and 
+            current_time >= self._backoff_until[self._last_successful_idx]):
+            indices.append(self._last_successful_idx)
+        
+        for idx in range(len(self._llms)):
+            if idx != self._last_successful_idx and current_time >= self._backoff_until[idx]:
+                indices.append(idx)
+        
+        if not indices:  # All in backoff
+            indices = sorted(range(len(self._llms)), key=lambda i: self._backoff_until[i])
+        
+        # Try each model
+        for idx in indices:
             llm = self._llms[idx]
-            provider_name = f"{llm.__class__.__name__} || Model: {llm.model_name if hasattr(llm, 'model_name') else 'UNKNOWN'}"
-            
-            logger.debug(f"Trying provider: {provider_name} (index {idx})")
-            
             try:
-                result = self._call(
-                    llm,
-                    prompt,
-                    schema=schema,
-                    temperature=temperature,
-                    **kwargs,
-                )
-                # Success! Clear any backoff for this LLM
+                if method_name == '_generate':
+                    result = llm._generate(*args, **kwargs)
+                else:
+                    method = getattr(llm, method_name)
+                    result = method(*args, **kwargs) if callable(method) else method
+                
+                # Success!
                 self._backoff_until[idx] = 0
-                logger.info(f"Successfully used {provider_name} (index {idx})")
+                self._last_successful_idx = idx
                 return result
                 
+            except AttributeError:
+                continue  # Model doesn't have this method
             except Exception as err:
-                error_msg = str(err).lower()
-                  
-                if any(s in error_msg for s in RATE_LIMIT_SYNS):
-                    # Apply exponential backoff - start with 60s, double each time
-                    # If this is the first failure, backoff 60s, otherwise double the current backoff
-                    current_backoff = max(60, (self._backoff_until[idx] - current_time) * 2 if self._backoff_until[idx] > current_time else 60)
-                    self._backoff_until[idx] = current_time + current_backoff
-                    
-                    logger.warning(
-                        f"{provider_name} rate-limited "
-                        f"(index {idx}) - backing off for {current_backoff}s, trying next provider."
-                    )
-                else:
-                    # For non-rate-limit errors, use a shorter backoff
-                    self._backoff_until[idx] = current_time + 10
-                    # Log the actual exception type and message
-                    logger.error(f"{provider_name} failed (index {idx}): {type(err).__name__}: {err}")
+                last_exception = err
+                self._apply_backoff(idx, str(err))
                 continue
-                
-        logger.critical("All LLM providers failed")
-        raise RuntimeError("All LLM providers failed - check logs for details")
-
-    def with_structured_outputs(self, schema: Type):
-        """
-        Create a wrapper that always uses the specified schema for structured output.
         
-        Args:
-            schema (Type): Pydantic schema to use for structured output
+        # All failed
+        if last_exception:
+            raise last_exception
+        else:
+            raise AttributeError(f"No model supports method '{method_name}'")
+
+    def _try_structured_output(self, schema, input, **kwargs):
+        """Try structured output on all models with smart ordering."""
+        current_time = time.time()
+        last_exception = None
+        
+        # Smart ordering: last successful first, then others
+        indices = []
+        if (self._last_successful_idx < len(self._llms) and 
+            current_time >= self._backoff_until[self._last_successful_idx]):
+            indices.append(self._last_successful_idx)
+        
+        for idx in range(len(self._llms)):
+            if idx != self._last_successful_idx and current_time >= self._backoff_until[idx]:
+                indices.append(idx)
+        
+        if not indices:  # All in backoff
+            indices = sorted(range(len(self._llms)), key=lambda i: self._backoff_until[i])
+        
+        # Try each model
+        for idx in indices:
+            llm = self._llms[idx]
+            try:
+                structured_llm = llm.with_structured_output(schema, **kwargs)
+                result = structured_llm.invoke(input)
+                
+                # Success!
+                self._backoff_until[idx] = 0
+                self._last_successful_idx = idx
+                return result
+                
+            except (AttributeError, NotImplementedError):
+                continue  # Model doesn't support structured output
+            except Exception as err:
+                last_exception = err
+                self._apply_backoff(idx, str(err))
+                continue
+        
+        # All failed
+        if last_exception:
+            raise last_exception
+        else:
+            raise AttributeError("No model supports with_structured_output functionality")
+
+    # Required BaseChatModel methods
+    @property
+    def _llm_type(self) -> str:
+        return "FreeFlowRouter"
+    
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return self._try_all_models('_generate', messages, stop=stop, 
+                                  run_manager=run_manager, **kwargs)
+    
+    def bind_tools(self, tools, **kwargs):
+        """Bind tools to all underlying models in-place."""
+        new_llms = []
+        
+        for idx, llm in enumerate(self._llms):
+            try:
+                bound_llm = llm.bind_tools(tools, **kwargs)
+                new_llms.append(bound_llm)
+            except (NotImplementedError, AttributeError):
+                # Skip models that don't support bind_tools
+                continue
+        
+        if not new_llms:
+            raise RuntimeError("No models support bind_tools functionality")
+        
+        # Replace with only the models that support tools
+        self._llms = new_llms.copy()
+        
+        # Reset exponential backoff since we're binding tools at the beginning
+        self._backoff_until = [0] * len(self._llms)
+        self._last_successful_idx = 0
+        
+        return self
+    
+    def with_structured_output(self, schema, **kwargs):
+        """Return a wrapper that uses structured output with failover."""
+        class StructuredOutputWrapper:
+            def __init__(self, router, schema, **kwargs):
+                self.router = router
+                self.schema = schema
+                self.kwargs = kwargs
             
-        Returns:
-            A wrapper object with an invoke method that uses the schema
-        """
-        class _Wrapper:
-            def __init__(self, outer): 
-                self._outer = outer
-                
-            def invoke(self, prompt: str, **kw):
-                """Invoke with the predefined schema"""
-                return self._outer.invoke(prompt, schema=schema, **kw)
-                
-        return _Wrapper(self)
+            def invoke(self, input, **invoke_kwargs):
+                # Use the existing _try_structured_output method with failover
+                return self.router._try_structured_output(self.schema, input, **{**self.kwargs, **invoke_kwargs})
+            
+            def __getattr__(self, attr_name):
+                # For any other method, delegate to the first working structured model
+                def wrapper_method(*args, **kwargs):
+                    structured_model = self.router._try_all_models('with_structured_output', self.schema, **self.kwargs)
+                    return getattr(structured_model, attr_name)(*args, **kwargs)
+                return wrapper_method
+        
+        return StructuredOutputWrapper(self, schema, **kwargs)
+    
+    # Convenience properties
+    @property
+    def active_model(self):
+        return self._get_best_model()
+    
+    @property
+    def model_name(self):
+        active = self._get_best_model()
+        return getattr(active, 'model_name', getattr(active, 'model', 'unknown'))
+    
+    @property 
+    def model(self):
+        return self.model_name
+    
+    def get_model_info(self):
+        """Get info about current active model."""
+        active = self._get_best_model()
+        return {
+            'class_name': active.__class__.__name__,
+            'model_name': getattr(active, 'model_name', getattr(active, 'model', 'unknown')),
+            'api_key_index': getattr(active, 'api_key_index', 'unknown'),
+            'provider_count': len(self._llms),
+            'active_provider_index': self._llms.index(active) if active in self._llms else -1
+        }
+    
+    def invoke_with_failover(self, *args, **kwargs):
+        """Explicit failover invoke - same as regular invoke()."""
+        return self.invoke(*args, **kwargs)
+    
+    def invoke_active_only(self, *args, **kwargs):
+        """Invoke using only the active model without failover."""
+        return self.active_model.invoke(*args, **kwargs)
+    
+    def __getattr__(self, name):
+        """Delegate ANY method to best model with failover."""
+        # Skip internal attributes
+        if name.startswith('_') or name.startswith('__pydantic'):
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+        
+        # Special case for LangChain's 'get' method
+        if name == 'get':
+            def get_method(key, default=None):
+                if key == 'callback_manager':
+                    return None
+                return getattr(self._get_best_model(), key, default)
+            return get_method
+        
+        # For any other method/attribute - try with failover
+        def method_with_failover(*args, **kwargs):
+            return self._try_all_models(name, *args, **kwargs)
+        
+        # Check if any model has this attribute
+        for llm in self._llms:
+            try:
+                attr = getattr(llm, name)
+                return method_with_failover if callable(attr) else attr
+            except AttributeError:
+                continue
+        
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
 
 if __name__ == "__main__":
-
-    from core import OpenRouter
-    from config import PROVIDER_CONFIG
+    # Handle both relative and absolute imports
+    try:
+        from .config import PROVIDER_CONFIG
+    except ImportError:
+        from config import PROVIDER_CONFIG
     
-    router = OpenRouter(config=PROVIDER_CONFIG)
-    response = router.invoke("HELLO") # Best way to use as it assigns active model based on availability
-    print(response)
-
-    for llm in router._llms: # Each llm is a Langchain Model so you can directly use it as .invoke(), chain etc
-        try:
-            llm.invoke("Hello!")
-        except Exception as e:
-            print(F"Error occured:{e} for llm: {llm.__class__.__name__}")
-            print("-"*100)
+    router = FreeFlowRouter(config=PROVIDER_CONFIG)
+    
+    print("FreeFlowRouter - Clean & Simple")
+    print(f"Loaded {len(router._llms)} models")
+    print(f"Active: {router.get_model_info()}")
+    
+    # Test basic functionality
+    response = router.invoke("Hello!")
+    print(f"Response: {response.content}")
+    
+    # Test any LangChain method - they all work with failover!
+    print(f"Model name: {router.model_name}")
+    
+    print("\nAll LangChain methods work with automatic failover!")

@@ -39,9 +39,9 @@ The Free LLM Router is your wingman that:
 ### Basic Usage
 
 ```python
-from free_llm_router import OpenRouter
+from core import FreeFlowRouter
 
-router = OpenRouter()
+router = FreeFlowRouter()
 response = router.invoke("Tell me a joke about misery")
 print(response)
 
@@ -85,7 +85,7 @@ Create accounts at these services to get free API keys:
 - [Groq](https://console.groq.com/) - Ultra-fast inference
 - [Together AI](https://www.together.ai/) - Various open models
 - [Mistral AI](https://console.mistral.ai/) - Mistral models
-- [OpenRouter](https://openrouter.ai/) - Gateway to many models
+- [OpenRouter](https://api.openrouter.ai/v1) - Gateway to many models
 - [Cerebras](https://www.cerebras.ai/) - High-throughput models
 
 ### 2. Get Your Free API Keys
@@ -97,7 +97,7 @@ Create accounts at these services to get free API keys:
 - [Groq](https://console.groq.com/)
 - [Together AI](https://www.together.ai/)
 - [Mistral AI](https://console.mistral.ai/)
-- [OpenRouter](https://openrouter.ai/)
+- [OpenRouter](https://api.openrouter.ai/v1)
 - [Cerebras](https://www.cerebras.ai/)
 
 
